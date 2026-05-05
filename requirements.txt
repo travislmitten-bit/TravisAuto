@@ -1,0 +1,4 @@
+numpy>=1.24
+requests>=2.31
+rich>=13.0
+python-dotenv>=1.0

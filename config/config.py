@@ -1,0 +1,47 @@
+import os
+from dataclasses import dataclass, field
+from typing import List
+
+
+@dataclass
+class KrakenConfig:
+    api_key: str = os.getenv("KRAKEN_API_KEY", "")
+    api_secret: str = os.getenv("KRAKEN_API_SECRET", "")
+    base_url: str = "https://api.kraken.com"
+
+
+@dataclass
+class TrendlineConfig:
+    lookback_candles: int = 100
+    min_touches: int = 2
+    swing_window: int = 5
+    breakout_threshold: float = 0.002   # 0.2% beyond line to confirm break
+    touch_tolerance: float = 0.003      # 0.3% tolerance to count as a touch
+    min_slope_angle: float = 5.0        # degrees, filters near-flat lines
+
+
+@dataclass
+class RiskConfig:
+    max_risk_per_trade: float = 0.01    # 1% of account per trade
+    max_open_trades: int = 3
+    default_rr_ratio: float = 2.0       # reward:risk
+    trailing_stop: bool = True
+    trailing_stop_atr_mult: float = 1.5
+    max_daily_loss: float = 0.03        # 3% daily drawdown halt
+
+
+@dataclass
+class BotConfig:
+    pairs: List[str] = field(default_factory=lambda: [
+        "XBTUSD", "ETHUSD", "SOLUSD", "AVAXUSD"
+    ])
+    interval: int = 60          # candle interval in minutes (Kraken: 1,5,15,30,60,240,1440)
+    dry_run: bool = True         # paper trade by default
+    poll_seconds: int = 30
+    log_level: str = "INFO"
+    kraken: KrakenConfig = field(default_factory=KrakenConfig)
+    trendline: TrendlineConfig = field(default_factory=TrendlineConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+
+
+CONFIG = BotConfig()
