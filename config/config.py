@@ -41,7 +41,7 @@ class BotConfig:
         os.getenv("PAIRS", "XBTUSD,SOLUSD,TAOUSD,LINKUSD").split(",")
         if p.strip()
     ])
-    interval: int = int(os.getenv("INTERVAL", "60"))
+    interval: int = int(os.getenv("INTERVAL", "240"))
     dry_run: bool = os.getenv("DRY_RUN", "true").lower() not in ("false", "0", "no")
     poll_seconds: int = 30
     log_level: str = "INFO"
