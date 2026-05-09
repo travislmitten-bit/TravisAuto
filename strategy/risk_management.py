@@ -33,6 +33,12 @@ class Trade:
     breakeven_set: bool = False
     hold_30_active: bool = False    # 30% held after 70% take-profit exit
     wide_stop: float = 0.0          # weekly 20MA stop for hold-30 leg
+    exit_mode: str = "4h"           # "4h" | "daily" | "weekly"
+    exit_mode_reason: str = ""      # human-readable reason for last switch
+
+    @property
+    def exit_mode_elevated(self) -> bool:
+        return self.exit_mode in ("daily", "weekly")
 
 
 class RiskManager:
@@ -318,12 +324,14 @@ class RiskManager:
             if trade.side == "buy":
                 if price <= active_stop:
                     exits.append((tid, price, "stop_loss"))
-                elif price >= trade.take_profit and not trade.partial_exit_done:
+                elif price >= trade.take_profit and not trade.partial_exit_done \
+                        and not trade.exit_mode_elevated:
                     exits.append((tid, price, "take_profit"))
             else:
                 if price >= active_stop:
                     exits.append((tid, price, "stop_loss"))
-                elif price <= trade.take_profit and not trade.partial_exit_done:
+                elif price <= trade.take_profit and not trade.partial_exit_done \
+                        and not trade.exit_mode_elevated:
                     exits.append((tid, price, "take_profit"))
         return exits
 

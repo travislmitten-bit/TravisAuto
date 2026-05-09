@@ -23,7 +23,7 @@ import numpy as np
 
 from config.config import CONFIG
 from kraken.api import KrakenAPI
-from strategy.trendline import generate_signals, Signal
+from strategy.trendline import generate_signals, Signal, detect_trendlines
 from strategy.risk_management import RiskManager
 from strategy.regime import Regime, RegimeParams, detect_regime, REGIME_PARAMS
 from strategy.analytics import (
@@ -367,21 +367,186 @@ class TravisAutoBot:
             return
         self.risk.open_trade(pair, side, entry, stop, target, volume)
 
+    # ── Multi-timeframe dynamic exit ──────────────────────────────────────────
+
+    def _upgrade_exit_modes(
+        self, prices: Dict[str, float], data_4h: Dict[str, dict]
+    ):
+        """
+        Per cycle: evaluate each open trade for parabolic move conditions and
+        upgrade (or revert) its exit_mode.
+
+        Upgrade rules (in priority order):
+          ≥15% directional move in 48h → switch to WEEKLY trendline exit
+          ≥5% in 24h with no adverse 4h candle → switch to DAILY trendline exit
+
+        Revert rules:
+          WEEKLY → stays weekly until weekly trendline break or SL (no auto-revert)
+          DAILY  → reverts to 4H when the daily candle closes below the daily
+                   support trendline (handled in _check_elevated_exits)
+        """
+        for tid, trade in list(self.risk.open_trades.items()):
+            pair = trade.pair
+            price = prices.get(pair)
+            d = data_4h.get(pair)
+            if price is None or d is None:
+                continue
+
+            closes = d["closes"]
+            opens  = d["opens"]
+            sign   = 1 if trade.side == "buy" else -1
+
+            move_24h = sign * (price - closes[-7])  / (closes[-7]  + 1e-9) if len(closes) >= 7  else 0.0
+            move_48h = sign * (price - closes[-13]) / (closes[-13] + 1e-9) if len(closes) >= 13 else 0.0
+
+            # No adverse candle in last 6 4h periods (= 24h)
+            if len(closes) >= 6:
+                if trade.side == "buy":
+                    no_adverse = all(closes[i] >= opens[i] for i in range(-6, 0))
+                else:
+                    no_adverse = all(closes[i] <= opens[i] for i in range(-6, 0))
+            else:
+                no_adverse = False
+
+            # ── Weekly upgrade ────────────────────────────────────────────────
+            if move_48h >= 0.15 and trade.exit_mode != "weekly":
+                old = trade.exit_mode.upper()
+                trade.exit_mode = "weekly"
+                trade.exit_mode_reason = (
+                    f"{move_48h:.1%} directional move in 48h"
+                )
+                logger.warning(
+                    "EXIT MODE | %s %s | %s → WEEKLY | reason: %s",
+                    tid, pair, old, trade.exit_mode_reason,
+                )
+
+            # ── Daily upgrade (only from 4h, not from weekly) ─────────────────
+            elif move_24h >= 0.05 and no_adverse and trade.exit_mode == "4h":
+                trade.exit_mode = "daily"
+                trade.exit_mode_reason = (
+                    f"{move_24h:.1%} in 24h, no adverse 4h candle"
+                )
+                logger.warning(
+                    "EXIT MODE | %s %s | 4H → DAILY | reason: %s",
+                    tid, pair, trade.exit_mode_reason,
+                )
+
+    def _check_elevated_exits(
+        self, prices: Dict[str, float]
+    ):
+        """
+        For DAILY mode trades: detect if the daily candle closed below the
+        daily support trendline → revert to 4h (don't close here; let normal
+        SL/trail catch the exit on the next 4h candle).
+
+        For WEEKLY mode trades: detect if the weekly candle closed below the
+        weekly support trendline → close the trade immediately.
+
+        Returns list of (trade_id, exit_price, reason) to close.
+        """
+        exits_to_close = []
+
+        for tid, trade in list(self.risk.open_trades.items()):
+            if not trade.exit_mode_elevated:
+                continue
+
+            pair  = trade.pair
+            price = prices.get(pair, 0.0)
+
+            if trade.exit_mode == "daily":
+                try:
+                    d = self._fetch_ohlcv(pair, interval=1440)
+                    n = len(d["closes"])
+                    sup_lines, res_lines = detect_trendlines(
+                        d["opens"], d["highs"], d["lows"], d["closes"],
+                        CONFIG.trendline,
+                    )
+                    lines = sup_lines if trade.side == "buy" else res_lines
+                    if not lines:
+                        continue
+                    line_price = lines[0].price_at(n - 1)
+                    daily_close = float(d["closes"][-1])
+
+                    broken = (trade.side == "buy"  and daily_close < line_price) or \
+                             (trade.side == "sell" and daily_close > line_price)
+                    if broken:
+                        logger.warning(
+                            "EXIT MODE | %s %s | DAILY → 4H (revert) | "
+                            "daily close %.4f crossed %s trendline %.4f — "
+                            "parabolic over, reverting to 4h exit logic",
+                            tid, pair, daily_close,
+                            "below support" if trade.side == "buy" else "above resistance",
+                            line_price,
+                        )
+                        trade.exit_mode = "4h"
+                        trade.exit_mode_reason = (
+                            f"daily close {daily_close:.4f} crossed trendline {line_price:.4f}"
+                        )
+                except Exception as e:
+                    logger.debug("Daily trendline check failed for %s: %s", pair, e)
+
+            elif trade.exit_mode == "weekly":
+                try:
+                    d = self._fetch_ohlcv(pair, interval=10080)
+                    n = len(d["closes"])
+                    sup_lines, res_lines = detect_trendlines(
+                        d["opens"], d["highs"], d["lows"], d["closes"],
+                        CONFIG.trendline,
+                    )
+                    lines = sup_lines if trade.side == "buy" else res_lines
+                    if not lines:
+                        continue
+                    line_price = lines[0].price_at(n - 1)
+                    weekly_close = float(d["closes"][-1])
+
+                    broken = (trade.side == "buy"  and weekly_close < line_price) or \
+                             (trade.side == "sell" and weekly_close > line_price)
+                    if broken:
+                        logger.warning(
+                            "EXIT MODE | %s %s | WEEKLY trendline break → CLOSING | "
+                            "weekly close %.4f crossed %s trendline %.4f",
+                            tid, pair, weekly_close,
+                            "below support" if trade.side == "buy" else "above resistance",
+                            line_price,
+                        )
+                        exits_to_close.append((tid, price, "weekly_trendline_break"))
+                except Exception as e:
+                    logger.debug("Weekly trendline check failed for %s: %s", pair, e)
+
+        return exits_to_close
+
     # ── Exit management ───────────────────────────────────────────────────────
 
     def _manage_exits(self):
         prices: Dict[str, float] = {}
         atr_values: Dict[str, float] = {}
+        data_4h: Dict[str, dict] = {}
 
         for trade in self.risk.open_trades.values():
             try:
                 prices[trade.pair] = self.kraken.get_mid_price(trade.pair)
                 data = self._fetch_ohlcv(trade.pair)
+                data_4h[trade.pair] = data
                 atr_values[trade.pair] = RiskManager.compute_atr(
                     data["highs"].tolist(), data["lows"].tolist(), data["closes"].tolist()
                 )
             except Exception as e:
                 logger.debug("Price fetch error for %s: %s", trade.pair, e)
+
+        # Dynamic exit mode: upgrade to daily/weekly on parabolic moves
+        self._upgrade_exit_modes(prices, data_4h)
+
+        # Elevated exit checks: daily revert or weekly trendline close
+        for tid, exit_price, reason in self._check_elevated_exits(prices):
+            trade = self.risk.open_trades.get(tid)
+            if not trade:
+                continue
+            closed = self.risk.close_trade(tid, exit_price, reason)
+            if closed:
+                logger.info(
+                    "Exit %s | %s | reason=%s | exit_mode=weekly | pnl=%.4f",
+                    tid, trade.pair, reason, closed.pnl,
+                )
 
         # R-milestone: 2R partial exit + breakeven SL, 3R trailing
         for tid, exit_price in self.risk.update_r_milestones(prices):
@@ -396,6 +561,7 @@ class TravisAutoBot:
         )
 
         # Full exits: stop loss or take profit
+        # Note: check_exits already suppresses TP for elevated-mode trades
         for tid, exit_price, reason in self.risk.check_exits(prices):
             trade = self.risk.open_trades.get(tid)
             if not trade:
@@ -421,8 +587,8 @@ class TravisAutoBot:
             closed = self.risk.close_trade(tid, exit_price, reason)
             if closed:
                 logger.info(
-                    "Exit %s | %s | reason=%s | pnl=%.4f | staking_total=%.4f",
-                    tid, trade.pair, reason, closed.pnl, self._staking_income,
+                    "Exit %s | %s | reason=%s | exit_mode=%s | pnl=%.4f | staking_total=%.4f",
+                    tid, trade.pair, reason, trade.exit_mode, closed.pnl, self._staking_income,
                 )
 
         # Hold-30 leg: exit if weekly close crossed the 20-week MA
