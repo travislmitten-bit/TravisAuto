@@ -1,6 +1,10 @@
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
 
 @dataclass
@@ -33,10 +37,12 @@ class RiskConfig:
 @dataclass
 class BotConfig:
     pairs: List[str] = field(default_factory=lambda: [
-        "XBTUSD", "ETHUSD", "SOLUSD", "AVAXUSD"
+        p.strip() for p in
+        os.getenv("PAIRS", "XBTUSD,SOLUSD,TAOUSD,LINKUSD").split(",")
+        if p.strip()
     ])
-    interval: int = 60          # candle interval in minutes (Kraken: 1,5,15,30,60,240,1440)
-    dry_run: bool = True         # paper trade by default
+    interval: int = int(os.getenv("INTERVAL", "60"))
+    dry_run: bool = os.getenv("DRY_RUN", "true").lower() not in ("false", "0", "no")
     poll_seconds: int = 30
     log_level: str = "INFO"
     kraken: KrakenConfig = field(default_factory=KrakenConfig)

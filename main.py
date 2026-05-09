@@ -9,8 +9,9 @@ from __future__ import annotations
 import logging
 import os
 
+from pathlib import Path
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env", override=True)
 import signal
 import sys
 import time
@@ -36,8 +37,7 @@ logger = logging.getLogger("TravisAuto")
 
 class TravisAutoBot:
     def __init__(self):
-        dry_run_env = os.getenv("DRY_RUN", "true").lower()
-        self.dry_run = dry_run_env not in ("false", "0", "no")
+        self.dry_run = CONFIG.dry_run
         if not self.dry_run:
             logger.warning("LIVE TRADING MODE — real orders will be placed")
 
