@@ -61,6 +61,8 @@ class TravisAutoBot:
         return dict(opens=opens, highs=highs, lows=lows, closes=closes, volumes=volumes)
 
     def _update_balance(self):
+        if self.dry_run:
+            return
         try:
             if CONFIG.kraken.api_key:
                 tb = self.kraken.get_trade_balance()
@@ -116,9 +118,16 @@ class TravisAutoBot:
         self._execute_trade(pair, side, top.price, top.suggested_stop, top.suggested_target, volume)
 
     def _execute_trade(self, pair, side, entry, stop, target, volume):
+        if self.dry_run:
+            logger.info(
+                "[DRY RUN] Would place %s market order | %s | vol=%.8f | SL=%.4f | TP=%.4f",
+                side.upper(), pair, volume, stop, target,
+            )
+            self.risk.open_trade(pair, side, entry, stop, target, volume)
+            return
         try:
-            result = self.kraken.place_market_order(pair, side, volume, dry_run=self.dry_run)
-            logger.info("Order result: %s", result)
+            result = self.kraken.place_market_order(pair, side, volume, dry_run=False)
+            logger.info("Order placed: %s", result)
         except Exception as e:
             logger.error("Order placement failed for %s: %s", pair, e)
             return
