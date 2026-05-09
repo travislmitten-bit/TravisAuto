@@ -36,7 +36,8 @@ class RiskConfig:
 
 @dataclass
 class ScannerConfig:
-    taostats_api_key: str = os.getenv("TAOSTATS_API_KEY", "")
+    taostats_api_key:   str = os.getenv("TAOSTATS_API_KEY", "")
+    lunarcrush_api_key: str = os.getenv("LUNARCRUSH_API_KEY", "")
     scan_interval: int = 4 * 3600   # seconds; matches cache TTL
 
 

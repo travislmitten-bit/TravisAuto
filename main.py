@@ -33,6 +33,7 @@ from strategy.analytics import (
     calculate_sma,
 )
 from strategy.data_scanner import DataScanner, ScanResult, neutral_result
+from strategy.volatility import VolatilityTracker, pearson_correlation, PAIR_TO_SYMBOL
 
 logging.basicConfig(
     level=getattr(logging, CONFIG.log_level, logging.INFO),
@@ -64,8 +65,12 @@ class TravisAutoBot:
             base_url=CONFIG.kraken.base_url,
         )
         self.risk = RiskManager(CONFIG.risk)
-        self.scanner = DataScanner(taostats_api_key=CONFIG.scanner.taostats_api_key)
+        self.scanner = DataScanner(
+            taostats_api_key=CONFIG.scanner.taostats_api_key,
+            lunarcrush_api_key=CONFIG.scanner.lunarcrush_api_key,
+        )
         self._scan: ScanResult = neutral_result()
+        self._vol_tracker = VolatilityTracker()   # BB compression per pair
         self._running = False
         self._account_balance: float = 10_000.0
 
@@ -123,6 +128,31 @@ class TravisAutoBot:
         """Regime min_confidence adjusted by scanner sentiment."""
         base = self._regime_params.min_confidence
         return max(0.0, min(1.0, base + self._scan.confidence_delta))
+
+    def _correlation_scalar(self, pair: str, new_closes: list) -> float:
+        """
+        Feature 4 — Correlation-adjusted position sizing.
+        If the new asset's 30-day 4h price series correlates > 0.75 with any
+        open position, reduce the new position to 60% of calculated size.
+        """
+        if not self.risk.open_trades:
+            return 1.0
+        for trade in self.risk.open_trades.values():
+            if trade.pair == pair:
+                continue
+            try:
+                data = self._fetch_ohlcv(trade.pair)
+                corr = pearson_correlation(new_closes, data["closes"].tolist(), n=180)
+                if abs(corr) > 0.75:
+                    logger.warning(
+                        "CORRELATION SIZING | %s↔%s r=%.2f>0.75 | "
+                        "new position reduced to 60%%",
+                        pair, trade.pair, corr,
+                    )
+                    return 0.60
+            except Exception as e:
+                logger.debug("Correlation check failed %s/%s: %s", pair, trade.pair, e)
+        return 1.0
 
     # ── Staking yield ─────────────────────────────────────────────────────────
 
@@ -251,9 +281,14 @@ class TravisAutoBot:
             logger.error("OHLCV fetch failed for %s: %s", pair, e)
             return
 
+        closes_list = data["closes"].tolist()
+
+        # Feature 1 — BB compression: update PRIMED state every cycle
+        self._vol_tracker.update(pair, closes_list)
+
         # ADX filter
         adx_val = calculate_adx(
-            data["highs"].tolist(), data["lows"].tolist(), data["closes"].tolist()
+            data["highs"].tolist(), data["lows"].tolist(), closes_list
         )
         skip, adx_size_scalar, adx_risk_cap = adx_scalars(adx_val)
         if skip:
@@ -276,23 +311,36 @@ class TravisAutoBot:
             return
 
         top = signals[0]
+
+        # Feature 3 — LunarCrush confidence boost (+8 pts if Galaxy Score > 60)
+        lc         = self._scan.lunarcrush.get(pair, {})
+        lc_boost   = 0.08 if lc.get("galaxy_score", 0) > 60 else 0.0
+        adj_conf   = min(1.0, top.confidence + lc_boost)
+        if lc_boost:
+            logger.info(
+                "LunarCrush boost | %s | GS=%.0f → conf %.2f → %.2f",
+                pair, lc["galaxy_score"], top.confidence, adj_conf,
+            )
+
         logger.info(
-            "Signal: %s | %s | price=%.4f | conf=%.2f | SL=%.4f | TP=%.4f | ADX=%.1f",
+            "Signal: %s | %s | price=%.4f | conf=%.2f (adj=%.2f) | "
+            "SL=%.4f | TP=%.4f | ADX=%.1f | primed=%s",
             top.signal.value, pair, top.price,
-            top.confidence, top.suggested_stop, top.suggested_target, adx_val,
+            top.confidence, adj_conf,
+            top.suggested_stop, top.suggested_target, adx_val,
+            self._vol_tracker.is_primed(pair),
         )
 
-        # Regime + scanner confidence gate
+        # Regime + scanner confidence gate (uses LunarCrush-adjusted confidence)
         conf_min = self._effective_confidence_min()
-        if top.confidence < conf_min:
+        if adj_conf < conf_min:
             logger.debug(
-                "Signal rejected — conf %.2f below threshold %.2f | %s [%s, scan=%s]",
-                top.confidence, conf_min, pair,
-                self._regime.value, self._scan.label,
+                "Signal rejected — adj_conf %.2f below threshold %.2f | %s [%s, scan=%s]",
+                adj_conf, conf_min, pair, self._regime.value, self._scan.label,
             )
             return
 
-        # Minimum profit threshold: target must be ≥2.4% from entry
+        # Minimum profit threshold: ≥2.4% from entry
         if top.price > 0:
             profit_pct = abs(top.suggested_target - top.price) / top.price
             if profit_pct < 0.024:
@@ -315,11 +363,17 @@ class TravisAutoBot:
         if adx_risk_cap is not None:
             base_risk = min(base_risk, adx_risk_cap)
 
-        rotation_scalar = self._rotation_scalars.get(pair, 1.0)
-        time_scalar     = self._time_scalar()
-        drawdown_scalar = self._drawdown_scalar()
-        sharpe_scalar   = self._sharpe_scalar()
-        scan_scalar     = self._scan.size_scalar
+        rotation_scalar  = self._rotation_scalars.get(pair, 1.0)
+        time_scalar      = self._time_scalar()
+        drawdown_scalar  = self._drawdown_scalar()
+        sharpe_scalar    = self._sharpe_scalar()
+        scan_scalar      = self._scan.size_scalar
+        # Feature 1 — BB compression: +50% if PRIMED
+        primed_scalar    = self._vol_tracker.size_scalar(pair)
+        # Feature 3 — Social momentum: +25% if AltRank improved 20+ in 24h
+        social_scalar    = 1.25 if lc.get("social_momentum") else 1.0
+        # Feature 4 — Correlation-adjusted sizing: 60% if r>0.75 with open position
+        corr_scalar      = self._correlation_scalar(pair, closes_list)
 
         effective_risk_pct = (
             base_risk
@@ -330,15 +384,19 @@ class TravisAutoBot:
             * drawdown_scalar
             * sharpe_scalar
             * scan_scalar
+            * primed_scalar
+            * social_scalar
+            * corr_scalar
         )
 
         logger.debug(
-            "Sizing %s | base_risk=%.4f | regime=%.1f | adx=%.1f | rot=%.1f | "
-            "time=%.1f | dd=%.1f | sharpe=%.1f | scan=%.1f[%.0f] → eff=%.4f",
+            "Sizing %s | base=%.4f | regime=%.1f | adx=%.1f | rot=%.1f | "
+            "time=%.1f | dd=%.1f | sharpe=%.1f | scan=%.1f | "
+            "primed=%.1f | social=%.2f | corr=%.2f → eff=%.4f",
             pair, base_risk,
-            self._regime_params.size_scalar, adx_size_scalar,
-            rotation_scalar, time_scalar, drawdown_scalar, sharpe_scalar,
-            scan_scalar, self._scan.composite, effective_risk_pct,
+            self._regime_params.size_scalar, adx_size_scalar, rotation_scalar,
+            time_scalar, drawdown_scalar, sharpe_scalar, scan_scalar,
+            primed_scalar, social_scalar, corr_scalar, effective_risk_pct,
         )
 
         volume = self.risk.calculate_position_size(
@@ -350,6 +408,8 @@ class TravisAutoBot:
 
         side = "buy" if top.signal in (Signal.BUY_BOUNCE, Signal.BUY_BREAK) else "sell"
         self._execute_trade(pair, side, top.price, top.suggested_stop, top.suggested_target, volume)
+        # Feature 1 — consume PRIMED state now that signal fired
+        self._vol_tracker.reset(pair)
 
     def _execute_trade(self, pair, side, entry, stop, target, volume):
         if self.dry_run:
@@ -555,10 +615,16 @@ class TravisAutoBot:
                 logger.info("[DRY RUN] Partial 50%% exit | trade %s | %.8f units @ %.4f",
                             tid, closed_vol, exit_price)
 
-        # ATR trailing (only for pre-partial trades; pass regime trail_mult)
-        self.risk.update_trailing_stops(
-            prices, atr_values, trail_mult=self._regime_params.trail_mult
-        )
+        # ATR trailing — Feature 5: smart money divergence tightens trail_mult to 0.5
+        trail_mult = self._regime_params.trail_mult
+        if self._scan.smart_money_divergence:
+            trail_mult = min(trail_mult, 0.5)
+            logger.warning(
+                "SMART MONEY DIVERGENCE active | trail_mult capped %.1f → 0.5 "
+                "| tightening all stops",
+                self._regime_params.trail_mult,
+            )
+        self.risk.update_trailing_stops(prices, atr_values, trail_mult=trail_mult)
 
         # Full exits: stop loss or take profit
         # Note: check_exits already suppresses TP for elevated-mode trades
