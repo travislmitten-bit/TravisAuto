@@ -10,6 +10,7 @@ Tori's Trendline Strategy
 """
 
 from __future__ import annotations
+import dataclasses
 import math
 from dataclasses import dataclass, field
 from enum import Enum
@@ -206,12 +207,17 @@ def generate_signals(
     volumes: np.ndarray,
     cfg: TrendlineConfig,
     rr_ratio: float = 2.0,
+    min_touches_override: Optional[int] = None,
 ) -> List[TrendlineSignal]:
     n = len(closes)
     if n < cfg.lookback_candles:
         return []
 
-    support_lines, resistance_lines = detect_trendlines(opens, highs, lows, closes, cfg)
+    active_cfg = (
+        dataclasses.replace(cfg, min_touches=min_touches_override)
+        if min_touches_override is not None else cfg
+    )
+    support_lines, resistance_lines = detect_trendlines(opens, highs, lows, closes, active_cfg)
 
     avg_vol = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(np.mean(volumes))
     current_vol = float(volumes[-1])

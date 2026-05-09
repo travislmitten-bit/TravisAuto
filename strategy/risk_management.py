@@ -1,13 +1,13 @@
 """
 Position sizing and trade lifecycle management.
-Uses fixed fractional risk: risk 1% of account per trade by default.
 """
 
 from __future__ import annotations
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 from config.config import RiskConfig
 
@@ -23,14 +23,16 @@ class Trade:
     stop_loss: float
     take_profit: float
     volume: float
-    status: str = "open"    # open | closed | cancelled
+    status: str = "open"
     exit_price: float = 0.0
     pnl: float = 0.0
     trailing_stop: float = 0.0
     notes: str = ""
-    r_value: float = 0.0           # |entry - stop|, risk per unit
+    r_value: float = 0.0           # |entry - stop|
     partial_exit_done: bool = False # 50% closed at 2R
-    breakeven_set: bool = False     # SL moved to entry at 2R
+    breakeven_set: bool = False
+    hold_30_active: bool = False    # 30% held after 70% take-profit exit
+    wide_stop: float = 0.0          # weekly 20MA stop for hold-30 leg
 
 
 class RiskManager:
@@ -40,24 +42,45 @@ class RiskManager:
         self._daily_pnl: float = 0.0
         self._daily_date: date = date.today()
         self._trade_counter: int = 0
+
+        # Drawdown protection
         self._consecutive_losses: int = 0
         self._drawdown_protection: bool = False
 
-    # ── Daily drawdown reset ──────────────────────────────────────────────────
+        # Kelly criterion — stores (pnl, trade_value) for last 200 trades
+        self._trade_history: Deque[Tuple[float, float]] = deque(maxlen=200)
 
-    def _check_date_rollover(self):
+        # Sharpe — daily PnL % for last 60 days
+        self._daily_pnl_pcts: List[float] = []
+        self._current_day: date = date.today()
+        self._day_start_balance: float = 0.0
+
+    # ── Daily rollover ────────────────────────────────────────────────────────
+
+    def tick_daily(self, account_balance: float):
+        """Call once per day to record daily PnL% for Sharpe calculation."""
         today = date.today()
-        if today != self._daily_date:
+        if today != self._current_day:
+            if self._day_start_balance > 0:
+                pct = self._daily_pnl / self._day_start_balance
+                self._daily_pnl_pcts.append(pct)
+                if len(self._daily_pnl_pcts) > 60:
+                    self._daily_pnl_pcts = self._daily_pnl_pcts[-60:]
             self._daily_pnl = 0.0
             self._daily_date = today
+            self._current_day = today
+            self._day_start_balance = account_balance
 
     # ── Checks ────────────────────────────────────────────────────────────────
 
     def can_trade(self, account_balance: float) -> bool:
-        self._check_date_rollover()
         if len(self._open_trades) >= self.cfg.max_open_trades:
             logger.warning("Max open trades reached (%d)", self.cfg.max_open_trades)
             return False
+        today = date.today()
+        if today != self._daily_date:
+            self._daily_pnl = 0.0
+            self._daily_date = today
         daily_loss_pct = abs(min(0.0, self._daily_pnl)) / (account_balance + 1e-9)
         if daily_loss_pct >= self.cfg.max_daily_loss:
             logger.warning("Daily loss limit hit (%.2f%%)", daily_loss_pct * 100)
@@ -77,13 +100,13 @@ class RiskManager:
         if won:
             self._consecutive_losses = 0
             if self._drawdown_protection:
-                logger.info("Drawdown protection LIFTED — winning trade restores full size")
+                logger.info("Drawdown protection LIFTED — winning trade restores full sizing")
                 self._drawdown_protection = False
         else:
             self._consecutive_losses += 1
             if self._consecutive_losses >= 3 and not self._drawdown_protection:
                 logger.warning(
-                    "Drawdown protection ACTIVE — %d consecutive losses, all position sizes halved",
+                    "Drawdown protection ACTIVE — %d consecutive losses, all sizes halved",
                     self._consecutive_losses,
                 )
                 self._drawdown_protection = True
@@ -95,24 +118,17 @@ class RiskManager:
         account_balance: float,
         entry: float,
         stop: float,
-        confidence: float = 1.0,
-        time_scalar: float = 1.0,
+        effective_risk_pct: float,
     ) -> float:
-        """Return volume scaled by confidence, drawdown protection, and time filter."""
-        confidence_scalar = 0.5 + 0.5 * min(max(confidence, 0.0), 1.0)
-        drawdown_scalar = 0.5 if self._drawdown_protection else 1.0
-        risk_amount = (
-            account_balance
-            * self.cfg.max_risk_per_trade
-            * confidence_scalar
-            * drawdown_scalar
-            * time_scalar
-        )
+        """
+        Pure risk-amount sizing. All scalars (confidence, regime, ADX, Kelly,
+        Sharpe, rotation, time, drawdown) are pre-applied in effective_risk_pct.
+        """
         per_unit_risk = abs(entry - stop)
         if per_unit_risk < 1e-9:
             return 0.0
-        volume = risk_amount / per_unit_risk
-        return round(volume, 8)
+        risk_amount = account_balance * effective_risk_pct
+        return round(risk_amount / per_unit_risk, 8)
 
     # ── Trade creation ────────────────────────────────────────────────────────
 
@@ -139,8 +155,10 @@ class RiskManager:
             r_value=abs(entry - stop),
         )
         self._open_trades[trade_id] = trade
-        logger.info("Opened trade %s | %s %s @ %.4f | SL %.4f TP %.4f | R=%.4f",
-                    trade_id, side.upper(), pair, entry, stop, target, trade.r_value)
+        logger.info(
+            "Opened trade %s | %s %s @ %.4f | SL %.4f TP %.4f | R=%.4f",
+            trade_id, side.upper(), pair, entry, stop, target, trade.r_value,
+        )
         return trade
 
     def close_trade(self, trade_id: str, exit_price: float, reason: str = "") -> Optional[Trade]:
@@ -153,111 +171,149 @@ class RiskManager:
         trade.status = "closed"
         trade.notes = reason
         self._daily_pnl += trade.pnl
+        trade_value = trade.entry_price * trade.volume
+        self._trade_history.append((trade.pnl, trade_value))
         won = trade.pnl > 0
         self.record_trade_result(won)
-        logger.info("Closed trade %s | exit %.4f | PnL %.4f | %s",
-                    trade_id, exit_price, trade.pnl, reason)
+        logger.info(
+            "Closed trade %s | exit %.4f | PnL %.4f | %s",
+            trade_id, exit_price, trade.pnl, reason,
+        )
         return trade
 
+    # ── Partial exits ─────────────────────────────────────────────────────────
+
     def partial_close_trade(self, trade_id: str, exit_price: float) -> Optional[float]:
-        """Close 50% of position at 2R. Returns the closed volume or None."""
+        """2R milestone: close 50%, move SL to breakeven. Returns closed volume."""
         trade = self._open_trades.get(trade_id)
         if not trade or trade.partial_exit_done:
             return None
-        half_vol = round(trade.volume / 2, 8)
+        half = round(trade.volume / 2, 8)
         sign = 1 if trade.side == "buy" else -1
-        partial_pnl = sign * (exit_price - trade.entry_price) * half_vol
-        trade.volume = half_vol
+        self._daily_pnl += sign * (exit_price - trade.entry_price) * half
+        trade.volume          = half
         trade.partial_exit_done = True
-        # Move SL to breakeven
-        trade.stop_loss = trade.entry_price
-        trade.trailing_stop = trade.entry_price
-        trade.breakeven_set = True
-        self._daily_pnl += partial_pnl
+        trade.stop_loss       = trade.entry_price
+        trade.trailing_stop   = trade.entry_price
+        trade.breakeven_set   = True
         logger.info(
-            "Partial exit 50%% | %s | closed %.8f units @ %.4f | partial PnL %.4f | SL → breakeven",
-            trade.pair, half_vol, exit_price, partial_pnl,
+            "Partial 2R exit | %s | closed %.8f @ %.4f | SL → breakeven %.4f",
+            trade.pair, half, exit_price, trade.entry_price,
         )
-        return half_vol
+        return half
 
-    # ── R-milestone management ────────────────────────────────────────────────
+    def exit_70_hold_30(
+        self, trade_id: str, exit_price: float, wide_stop: float
+    ) -> Optional[float]:
+        """
+        Take-profit exit: close 70%, hold remaining 30% with wide_stop.
+        Returns volume closed (70%).
+        """
+        trade = self._open_trades.get(trade_id)
+        if not trade or trade.hold_30_active:
+            return None
+        close_vol = round(trade.volume * 0.70, 8)
+        hold_vol  = round(trade.volume * 0.30, 8)
+        sign = 1 if trade.side == "buy" else -1
+        self._daily_pnl += sign * (exit_price - trade.entry_price) * close_vol
+        trade.volume        = hold_vol
+        trade.hold_30_active = True
+        trade.wide_stop     = wide_stop
+        trade.trailing_stop = wide_stop
+        trade.stop_loss     = wide_stop
+        logger.info(
+            "Take-profit 70%% exit | %s | closed %.8f @ %.4f | holding %.8f with wide SL %.4f (weekly 20MA)",
+            trade.pair, close_vol, exit_price, hold_vol, wide_stop,
+        )
+        return close_vol
+
+    # ── R-milestone updates ───────────────────────────────────────────────────
 
     def update_r_milestones(self, prices: Dict[str, float]) -> List[Tuple[str, float]]:
-        """
-        Returns list of (trade_id, price) for trades that just crossed 2R
-        and need a partial exit. Also activates 3R trailing in-place.
-        """
-        needs_partial = []
+        """Returns (trade_id, price) pairs that just crossed 2R → need partial exit."""
+        needs_partial: List[Tuple[str, float]] = []
         for tid, trade in list(self._open_trades.items()):
-            if trade.r_value <= 0:
+            if trade.r_value <= 0 or trade.hold_30_active:
                 continue
             price = prices.get(trade.pair)
             if price is None:
                 continue
-
-            sign = 1 if trade.side == "buy" else -1
+            sign     = 1 if trade.side == "buy" else -1
             profit_r = sign * (price - trade.entry_price) / trade.r_value
 
-            # 2R hit: queue partial exit (executed by caller)
             if profit_r >= 2.0 and not trade.partial_exit_done:
                 logger.info(
-                    "Trade %s hit 2R (%.2fR) | %s @ %.4f — queuing 50%% exit + breakeven SL",
+                    "Trade %s hit 2R (%.2fR) | %s @ %.4f — queuing 50%% exit + breakeven",
                     tid, profit_r, trade.pair, price,
                 )
                 needs_partial.append((tid, price))
 
-            # 3R hit: trail stop at 1R below current price
             if profit_r >= 3.0 and trade.partial_exit_done:
                 r = trade.r_value
                 if trade.side == "buy":
                     new_trail = round(price - r, 8)
                     if new_trail > trade.trailing_stop:
                         trade.trailing_stop = new_trail
-                        logger.info("Trade %s 3R trail | SL → %.4f (1R below %.4f)",
-                                    tid, new_trail, price)
+                        logger.info("Trade %s 3R trail | SL → %.4f", tid, new_trail)
                 else:
                     new_trail = round(price + r, 8)
                     if new_trail < trade.trailing_stop:
                         trade.trailing_stop = new_trail
-                        logger.info("Trade %s 3R trail | SL → %.4f (1R above %.4f)",
-                                    tid, new_trail, price)
+                        logger.info("Trade %s 3R trail | SL → %.4f", tid, new_trail)
 
         return needs_partial
 
+    def check_hold_exits(self, weekly_20ma: Dict[str, float]) -> List[Tuple[str, float, str]]:
+        """Check if weekly close crossed below (or above for shorts) the 20-week MA."""
+        exits = []
+        for tid, trade in list(self._open_trades.items()):
+            if not trade.hold_30_active:
+                continue
+            ma = weekly_20ma.get(trade.pair)
+            if ma is None:
+                continue
+            price = trade.wide_stop  # current MA level stored as wide_stop
+            if trade.side == "buy" and ma < trade.wide_stop:
+                exits.append((tid, ma, "weekly_20ma_break"))
+            elif trade.side == "sell" and ma > trade.wide_stop:
+                exits.append((tid, ma, "weekly_20ma_break"))
+        return exits
+
     # ── ATR trailing stop ─────────────────────────────────────────────────────
 
-    def update_trailing_stops(self, prices: Dict[str, float], atr_values: Dict[str, float]):
+    def update_trailing_stops(
+        self,
+        prices: Dict[str, float],
+        atr_values: Dict[str, float],
+        trail_mult: float = 1.0,
+    ):
         for tid, trade in list(self._open_trades.items()):
+            if trade.partial_exit_done or trade.hold_30_active:
+                continue
             price = prices.get(trade.pair)
-            atr = atr_values.get(trade.pair)
-            if price is None or atr is None:
+            atr   = atr_values.get(trade.pair)
+            if price is None or atr is None or not self.cfg.trailing_stop:
                 continue
-            if not self.cfg.trailing_stop:
-                continue
-            # Skip ATR trail once 3R logic has taken over
-            if trade.partial_exit_done:
-                continue
-            offset = atr * self.cfg.trailing_stop_atr_mult
+            offset = atr * self.cfg.trailing_stop_atr_mult * trail_mult
             if trade.side == "buy":
                 new_stop = price - offset
                 if new_stop > trade.trailing_stop:
                     trade.trailing_stop = round(new_stop, 8)
-                    logger.debug("ATR trail updated %s SL → %.4f", tid, trade.trailing_stop)
             else:
                 new_stop = price + offset
                 if new_stop < trade.trailing_stop:
                     trade.trailing_stop = round(new_stop, 8)
-                    logger.debug("ATR trail updated %s SL → %.4f", tid, trade.trailing_stop)
 
-    # ── Stop/target checks ────────────────────────────────────────────────────
+    # ── Stop / target checks ──────────────────────────────────────────────────
 
     def check_exits(self, prices: Dict[str, float]) -> List[Tuple[str, float, str]]:
-        """Returns list of (trade_id, exit_price, reason) for full closes."""
         exits = []
         for tid, trade in list(self._open_trades.items()):
             price = prices.get(trade.pair)
             if price is None:
                 continue
+            if trade.hold_30_active:
+                continue  # handled by check_hold_exits
             active_stop = trade.trailing_stop if self.cfg.trailing_stop else trade.stop_loss
             if trade.side == "buy":
                 if price <= active_stop:
@@ -296,3 +352,11 @@ class RiskManager:
     @property
     def daily_pnl(self) -> float:
         return self._daily_pnl
+
+    @property
+    def trade_history(self):
+        return self._trade_history
+
+    @property
+    def daily_pnl_pcts(self) -> List[float]:
+        return self._daily_pnl_pcts
