@@ -101,6 +101,16 @@ class TravisAutoBot:
         if top.confidence < 0.5:
             return
 
+        # Minimum profit threshold: target must be ≥2.4% from entry
+        if top.price > 0:
+            profit_pct = abs(top.suggested_target - top.price) / top.price
+            if profit_pct < 0.024:
+                logger.debug(
+                    "Signal rejected — profit %.2f%% below 2.4%% minimum | %s",
+                    profit_pct * 100, pair,
+                )
+                return
+
         if not self.risk.can_trade(self._account_balance):
             return
 
@@ -109,7 +119,7 @@ class TravisAutoBot:
 
         side = "buy" if top.signal in (Signal.BUY_BOUNCE, Signal.BUY_BREAK) else "sell"
         volume = self.risk.calculate_position_size(
-            self._account_balance, top.price, top.suggested_stop
+            self._account_balance, top.price, top.suggested_stop, top.confidence
         )
 
         if volume <= 0:

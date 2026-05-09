@@ -69,9 +69,12 @@ class RiskManager:
         account_balance: float,
         entry: float,
         stop: float,
+        confidence: float = 1.0,
     ) -> float:
-        """Return volume to trade so risk = max_risk_per_trade × balance."""
-        risk_amount = account_balance * self.cfg.max_risk_per_trade
+        """Return volume scaled by confidence: high-confidence signals risk more."""
+        # confidence linearly scales risk between 50% and 100% of max_risk_per_trade
+        confidence_scalar = 0.5 + 0.5 * min(max(confidence, 0.0), 1.0)
+        risk_amount = account_balance * self.cfg.max_risk_per_trade * confidence_scalar
         per_unit_risk = abs(entry - stop)
         if per_unit_risk < 1e-9:
             return 0.0
