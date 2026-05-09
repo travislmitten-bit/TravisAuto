@@ -104,10 +104,20 @@ def kelly_fraction(
 
 # ── Sharpe Ratio ──────────────────────────────────────────────────────────────
 
-def rolling_sharpe(daily_pnl_pcts: List[float], period: int = 30) -> float:
-    """Annualised Sharpe on a rolling window of daily PnL percentages."""
+def rolling_sharpe(
+    daily_pnl_pcts: List[float],
+    period: int = 30,
+    cold_start: float = 1.4,
+) -> float:
+    """
+    Annualised Sharpe on a rolling window of daily PnL percentages.
+    Returns cold_start when fewer than 5 live days exist — pre-seeded from
+    the 3-year backtest baseline so the bot opens at full sizing on day one.
+    Only drops below 1.0 (triggering the 0.5× penalty) if live trading
+    actually underperforms over a rolling 30-day window.
+    """
     if len(daily_pnl_pcts) < 5:
-        return 0.0
+        return cold_start
     arr = np.array(daily_pnl_pcts[-period:], dtype=float)
     if arr.std() < 1e-9:
         return 0.0

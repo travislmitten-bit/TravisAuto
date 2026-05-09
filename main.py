@@ -263,11 +263,13 @@ class TravisAutoBot:
         today = datetime.now(EST).timetuple().tm_yday
         if today == self._last_sharpe_log_day:
             return
+        n      = len(self.risk.daily_pnl_pcts)
         sharpe = rolling_sharpe(self.risk.daily_pnl_pcts, period=30)
         scalar = self._sharpe_scalar()
+        source = "backtest baseline, no live data yet" if n < 5 else f"{n} live days"
         logger.info(
-            "Daily Sharpe (30d) = %.2f | size scalar = %.1fx%s",
-            sharpe, scalar,
+            "Daily Sharpe (30d) = %.2f [%s] | size scalar = %.1fx%s",
+            sharpe, source, scalar,
             " — REDUCED due to low Sharpe" if scalar < 1.0 else "",
         )
         self._last_sharpe_log_day = today
