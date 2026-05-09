@@ -32,6 +32,7 @@ from strategy.analytics import (
     score_asset, compute_rotation_scalars,
     calculate_sma,
 )
+from strategy.data_scanner import DataScanner, ScanResult, neutral_result
 
 logging.basicConfig(
     level=getattr(logging, CONFIG.log_level, logging.INFO),
@@ -63,6 +64,8 @@ class TravisAutoBot:
             base_url=CONFIG.kraken.base_url,
         )
         self.risk = RiskManager(CONFIG.risk)
+        self.scanner = DataScanner(taostats_api_key=CONFIG.scanner.taostats_api_key)
+        self._scan: ScanResult = neutral_result()
         self._running = False
         self._account_balance: float = 10_000.0
 
@@ -106,6 +109,20 @@ class TravisAutoBot:
         if sharpe < 1.0:
             return 0.5
         return 1.0
+
+    # ── Scanner helpers ───────────────────────────────────────────────────────
+
+    def _refresh_scanner(self):
+        """Run the 4-hour data scan (respects internal cache TTL)."""
+        try:
+            self._scan = self.scanner.refresh()
+        except Exception as e:
+            logger.warning("DataScanner refresh failed: %s — using last result", e)
+
+    def _effective_confidence_min(self) -> float:
+        """Regime min_confidence adjusted by scanner sentiment."""
+        base = self._regime_params.min_confidence
+        return max(0.0, min(1.0, base + self._scan.confidence_delta))
 
     # ── Staking yield ─────────────────────────────────────────────────────────
 
@@ -265,12 +282,13 @@ class TravisAutoBot:
             top.confidence, top.suggested_stop, top.suggested_target, adx_val,
         )
 
-        # Regime confidence gate
-        if top.confidence < self._regime_params.min_confidence:
+        # Regime + scanner confidence gate
+        conf_min = self._effective_confidence_min()
+        if top.confidence < conf_min:
             logger.debug(
-                "Signal rejected — conf %.2f below regime min %.2f | %s [%s]",
-                top.confidence, self._regime_params.min_confidence,
-                pair, self._regime.value,
+                "Signal rejected — conf %.2f below threshold %.2f | %s [%s, scan=%s]",
+                top.confidence, conf_min, pair,
+                self._regime.value, self._scan.label,
             )
             return
 
@@ -301,6 +319,7 @@ class TravisAutoBot:
         time_scalar     = self._time_scalar()
         drawdown_scalar = self._drawdown_scalar()
         sharpe_scalar   = self._sharpe_scalar()
+        scan_scalar     = self._scan.size_scalar
 
         effective_risk_pct = (
             base_risk
@@ -310,15 +329,16 @@ class TravisAutoBot:
             * time_scalar
             * drawdown_scalar
             * sharpe_scalar
+            * scan_scalar
         )
 
         logger.debug(
             "Sizing %s | base_risk=%.4f | regime=%.1f | adx=%.1f | rot=%.1f | "
-            "time=%.1f | dd=%.1f | sharpe=%.1f → eff=%.4f",
+            "time=%.1f | dd=%.1f | sharpe=%.1f | scan=%.1f[%.0f] → eff=%.4f",
             pair, base_risk,
             self._regime_params.size_scalar, adx_size_scalar,
             rotation_scalar, time_scalar, drawdown_scalar, sharpe_scalar,
-            effective_risk_pct,
+            scan_scalar, self._scan.composite, effective_risk_pct,
         )
 
         volume = self.risk.calculate_position_size(
@@ -433,6 +453,7 @@ class TravisAutoBot:
             self.risk.tick_daily(self._account_balance)
             self._refresh_regime()
             self._refresh_rotation()
+            self._refresh_scanner()
             self._log_sharpe_daily()
             self._manage_exits()
             for pair in CONFIG.pairs:

@@ -35,6 +35,12 @@ class RiskConfig:
 
 
 @dataclass
+class ScannerConfig:
+    taostats_api_key: str = os.getenv("TAOSTATS_API_KEY", "")
+    scan_interval: int = 4 * 3600   # seconds; matches cache TTL
+
+
+@dataclass
 class BotConfig:
     pairs: List[str] = field(default_factory=lambda: [
         p.strip() for p in
@@ -48,6 +54,7 @@ class BotConfig:
     kraken: KrakenConfig = field(default_factory=KrakenConfig)
     trendline: TrendlineConfig = field(default_factory=TrendlineConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    scanner: ScannerConfig = field(default_factory=ScannerConfig)
 
 
 CONFIG = BotConfig()
