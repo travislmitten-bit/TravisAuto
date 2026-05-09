@@ -12,9 +12,11 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env", override=True)
+
 import signal
 import sys
 import time
+from datetime import datetime, timezone, timedelta
 from typing import Dict
 
 import numpy as np
@@ -34,6 +36,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TravisAuto")
 
+# EST = UTC-5 (no DST adjustment — conservative fixed offset)
+EST = timezone(timedelta(hours=-5))
+STAKING_APR = 0.04
+STAKING_LOG_INTERVAL = 3600   # log staking income once per hour
+
 
 class TravisAutoBot:
     def __init__(self):
@@ -49,6 +56,48 @@ class TravisAutoBot:
         self.risk = RiskManager(CONFIG.risk)
         self._running = False
         self._account_balance: float = 10_000.0
+
+        # Staking yield tracking
+        self._staking_income: float = 0.0
+        self._last_staking_accrual: float = time.time()
+        self._last_staking_log: float = time.time()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _is_low_liquidity_window(self) -> bool:
+        """True between 11pm and 5am EST (low-volume hours)."""
+        hour = datetime.now(EST).hour
+        return hour >= 23 or hour < 5
+
+    def _time_scalar(self) -> float:
+        if self._is_low_liquidity_window():
+            logger.info("Low-liquidity window active (11pm–5am EST) — position sizes reduced 50%%")
+            return 0.5
+        return 1.0
+
+    # ── Staking yield ─────────────────────────────────────────────────────────
+
+    def _accrue_staking(self):
+        """Simulate 4% APR yield on idle balance when no trades are open."""
+        if self.risk.open_trades:
+            self._last_staking_accrual = time.time()
+            return
+        now = time.time()
+        elapsed = now - self._last_staking_accrual
+        accrued = self._account_balance * (STAKING_APR / 365 / 86400) * elapsed
+        self._staking_income += accrued
+        self._last_staking_accrual = now
+
+        if now - self._last_staking_log >= STAKING_LOG_INTERVAL:
+            logger.info(
+                "Staking yield | accrued this cycle: $%.4f | total accumulated: $%.4f "
+                "(%.4f%% APR on $%.2f idle balance)",
+                accrued, self._staking_income,
+                STAKING_APR * 100, self._account_balance,
+            )
+            self._last_staking_log = now
+
+    # ── Data ──────────────────────────────────────────────────────────────────
 
     def _fetch_ohlcv(self, pair: str) -> Dict[str, np.ndarray]:
         raw = self.kraken.get_ohlcv(pair, interval=CONFIG.interval)
@@ -69,6 +118,8 @@ class TravisAutoBot:
                 self._account_balance = float(tb.get("e", self._account_balance))
         except Exception as e:
             logger.debug("Balance update skipped: %s", e)
+
+    # ── Signal processing ─────────────────────────────────────────────────────
 
     def _process_pair(self, pair: str):
         try:
@@ -117,9 +168,15 @@ class TravisAutoBot:
         if self.risk.already_in_pair(pair):
             return
 
+        # Log active filters before sizing
+        if self.risk.drawdown_protection_active:
+            logger.warning("Drawdown protection ACTIVE — position size halved for %s", pair)
+
+        time_scalar = self._time_scalar()
         side = "buy" if top.signal in (Signal.BUY_BOUNCE, Signal.BUY_BREAK) else "sell"
         volume = self.risk.calculate_position_size(
-            self._account_balance, top.price, top.suggested_stop, top.confidence
+            self._account_balance, top.price, top.suggested_stop,
+            top.confidence, time_scalar,
         )
 
         if volume <= 0:
@@ -143,6 +200,8 @@ class TravisAutoBot:
             return
         self.risk.open_trade(pair, side, entry, stop, target, volume)
 
+    # ── Exit management ───────────────────────────────────────────────────────
+
     def _manage_exits(self):
         prices: Dict[str, float] = {}
         atr_values: Dict[str, float] = {}
@@ -157,16 +216,27 @@ class TravisAutoBot:
             except Exception as e:
                 logger.debug("Price fetch error for %s: %s", trade.pair, e)
 
+        # R-milestone: 2R partial exit + breakeven SL, 3R trailing
+        for tid, exit_price in self.risk.update_r_milestones(prices):
+            closed_vol = self.risk.partial_close_trade(tid, exit_price)
+            if closed_vol and self.dry_run:
+                logger.info("[DRY RUN] Partial 50%% exit | trade %s | %.8f units @ %.4f",
+                            tid, closed_vol, exit_price)
+
+        # ATR trailing (only for trades not yet at partial exit stage)
         self.risk.update_trailing_stops(prices, atr_values)
 
+        # Full exits: stop loss or take profit
         for tid, exit_price, reason in self.risk.check_exits(prices):
             trade = self.risk.open_trades.get(tid)
             if not trade:
                 continue
             closed = self.risk.close_trade(tid, exit_price, reason)
             if closed:
-                logger.info("Exit %s | %s | reason=%s | pnl=%.4f",
-                            tid, trade.pair, reason, closed.pnl)
+                logger.info("Exit %s | %s | reason=%s | pnl=%.4f | staking_total=%.4f",
+                            tid, trade.pair, reason, closed.pnl, self._staking_income)
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
         self._running = True
@@ -176,6 +246,7 @@ class TravisAutoBot:
         )
         while self._running:
             self._update_balance()
+            self._accrue_staking()
             self._manage_exits()
             for pair in CONFIG.pairs:
                 self._process_pair(pair)
@@ -184,7 +255,10 @@ class TravisAutoBot:
 
     def stop(self):
         self._running = False
-        logger.info("TravisAuto stopping...")
+        logger.info(
+            "TravisAuto stopping | total staking income: $%.4f",
+            self._staking_income,
+        )
 
 
 def main():
