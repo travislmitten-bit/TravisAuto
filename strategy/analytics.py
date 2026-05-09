@@ -10,6 +10,11 @@ from typing import Dict, List, Optional, Tuple
 # ── ADX ───────────────────────────────────────────────────────────────────────
 
 def calculate_adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return _calculate_adx_inner(highs, lows, closes, period)
+
+
+def _calculate_adx_inner(highs: list, lows: list, closes: list, period: int) -> float:
     h = np.array(highs, dtype=float)
     l = np.array(lows, dtype=float)
     c = np.array(closes, dtype=float)
