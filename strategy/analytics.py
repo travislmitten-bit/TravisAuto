@@ -45,7 +45,8 @@ def _calculate_adx_inner(highs: list, lows: list, closes: list, period: int) -> 
     dsum = pdi + mdi
     dx   = np.where(dsum > 0, 100 * np.abs(pdi - mdi) / dsum, 0.0)
     adx  = _wilder(dx, period)
-    return float(adx[-1])
+    # _wilder outputs cumulative-sum scale (≈ period × average); divide to get 0-100
+    return float(adx[-1] / period)
 
 
 def adx_scalars(adx_value: float) -> Tuple[bool, float, Optional[float]]:

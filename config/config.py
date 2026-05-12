@@ -38,6 +38,7 @@ class RiskConfig:
 class ScannerConfig:
     taostats_api_key:   str = os.getenv("TAOSTATS_API_KEY", "")
     lunarcrush_api_key: str = os.getenv("LUNARCRUSH_API_KEY", "")
+    glassnode_api_key:  str = os.getenv("GLASSNODE_API_KEY", "")
     scan_interval: int = 4 * 3600   # seconds; matches cache TTL
 
 

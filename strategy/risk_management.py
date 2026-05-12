@@ -3,11 +3,13 @@ Position sizing and trade lifecycle management.
 """
 
 from __future__ import annotations
+import json
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date
-from typing import Deque, Dict, List, Optional, Tuple
+from datetime import date, datetime
+from pathlib import Path
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 from config.config import RiskConfig
 
@@ -35,6 +37,12 @@ class Trade:
     wide_stop: float = 0.0          # weekly 20MA stop for hold-30 leg
     exit_mode: str = "4h"           # "4h" | "daily" | "weekly"
     exit_mode_reason: str = ""      # human-readable reason for last switch
+    pyramid_count: int = 0          # pyramids added (max 2)
+    original_volume: float = 0.0    # captured on first pyramid for sizing reference
+    confidence: float = 0.0         # adjusted confidence at entry
+    regime: str = ""                # asset regime label at entry
+    entry_txid: str = ""            # Kraken txid of entry market order
+    broker_stop_txid: str = ""      # Kraken txid of currently-active stop-loss order
 
     @property
     def exit_mode_elevated(self) -> bool:
@@ -42,24 +50,107 @@ class Trade:
 
 
 class RiskManager:
-    def __init__(self, cfg: RiskConfig):
+    def __init__(self, cfg: RiskConfig, history_path: Optional[Path] = None):
         self.cfg = cfg
         self._open_trades: Dict[str, Trade] = {}
         self._daily_pnl: float = 0.0
         self._daily_date: date = date.today()
         self._trade_counter: int = 0
+        self._history_path: Optional[Path] = Path(history_path) if history_path else None
 
         # Drawdown protection
         self._consecutive_losses: int = 0
         self._drawdown_protection: bool = False
 
+        # Equity-curve drawdown (peak-to-trough)
+        self._peak_balance: float = 0.0
+        self._kill_switch_armed: bool = False
+        self._dd_pause_logged: bool = False
+        self._dd_kill_logged:  bool = False
+
         # Kelly criterion — stores (pnl, trade_value) for last 200 trades
         self._trade_history: Deque[Tuple[float, float]] = deque(maxlen=200)
+        self._load_history()
 
         # Sharpe — daily PnL % for last 60 days
         self._daily_pnl_pcts: List[float] = []
         self._current_day: date = date.today()
         self._day_start_balance: float = 0.0
+
+    # ── Persistent history ───────────────────────────────────────────────────
+
+    def _load_history(self):
+        """Hydrate the in-memory deque from the on-disk trade-history JSON."""
+        if not self._history_path or not self._history_path.exists():
+            return
+        try:
+            with self._history_path.open() as f:
+                records = json.load(f)
+            if not isinstance(records, list):
+                logger.warning("Trade history file is not a list — ignoring")
+                return
+            valid_for_kelly = 0
+            wins = losses = 0
+            for rec in records[-200:]:
+                try:
+                    pnl = float(rec.get("pnl", 0.0))
+                    tv  = float(rec.get("trade_value", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if tv > 0:
+                    self._trade_history.append((pnl, tv))
+                    valid_for_kelly += 1
+                    if pnl > 0:
+                        wins += 1
+                    else:
+                        losses += 1
+            win_rate = (wins / valid_for_kelly) if valid_for_kelly else 0.0
+            logger.warning(
+                "TRADE HISTORY | loaded %d records (%d valid for Kelly) | "
+                "wins=%d losses=%d win_rate=%.1f%% | source=%s",
+                len(records), valid_for_kelly, wins, losses, win_rate * 100,
+                self._history_path,
+            )
+        except Exception as e:
+            logger.warning(
+                "TRADE HISTORY | load failed: %s — starting fresh", e,
+            )
+
+    def _append_history(self, trade: "Trade", exit_price: float, reason: str):
+        """Atomically append a completed-trade record to the history JSON."""
+        if not self._history_path:
+            return
+        try:
+            self._history_path.parent.mkdir(parents=True, exist_ok=True)
+            records: list = []
+            if self._history_path.exists():
+                try:
+                    with self._history_path.open() as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, list):
+                        records = loaded
+                except Exception as e:
+                    logger.warning("History reload before append failed: %s", e)
+            records.append({
+                "timestamp":   datetime.now().isoformat(timespec="seconds"),
+                "trade_id":    trade.id,
+                "pair":        trade.pair,
+                "side":        trade.side,
+                "entry_price": round(trade.entry_price, 8),
+                "exit_price":  round(exit_price, 8),
+                "volume":      round(trade.volume, 8),
+                "pnl":         round(trade.pnl, 8),
+                "trade_value": round(trade.entry_price * trade.volume, 8),
+                "confidence":  round(trade.confidence, 4),
+                "regime":      trade.regime,
+                "reason":      reason,
+            })
+            tmp = self._history_path.with_suffix(".json.tmp")
+            with tmp.open("w") as f:
+                json.dump(records, f, indent=2)
+            tmp.replace(self._history_path)
+        except Exception as e:
+            logger.warning("Trade history append failed: %s", e)
 
     # ── Daily rollover ────────────────────────────────────────────────────────
 
@@ -80,6 +171,8 @@ class RiskManager:
     # ── Checks ────────────────────────────────────────────────────────────────
 
     def can_trade(self, account_balance: float) -> bool:
+        if self._kill_switch_armed:
+            return False
         if len(self._open_trades) >= self.cfg.max_open_trades:
             logger.warning("Max open trades reached (%d)", self.cfg.max_open_trades)
             return False
@@ -91,7 +184,50 @@ class RiskManager:
         if daily_loss_pct >= self.cfg.max_daily_loss:
             logger.warning("Daily loss limit hit (%.2f%%)", daily_loss_pct * 100)
             return False
+
+        # Equity-curve drawdown gates
+        dd = self.drawdown_pct(account_balance)
+        if dd >= 0.20:
+            self._kill_switch_armed = True
+            if not self._dd_kill_logged:
+                logger.critical(
+                    "KILL SWITCH ARMED | drawdown %.1f%% ≥ 20%% | peak=$%.2f current=$%.2f | "
+                    "halting all new entries — manual restart required to clear",
+                    dd * 100, self._peak_balance, account_balance,
+                )
+                self._dd_kill_logged = True
+            return False
+        if dd >= 0.15:
+            if not self._dd_pause_logged:
+                logger.warning(
+                    "DRAWDOWN PAUSE | drawdown %.1f%% ≥ 15%% | peak=$%.2f current=$%.2f | "
+                    "halting new entries until recovery",
+                    dd * 100, self._peak_balance, account_balance,
+                )
+                self._dd_pause_logged = True
+            return False
         return True
+
+    # ── Equity-curve drawdown ────────────────────────────────────────────────
+
+    def update_peak(self, account_balance: float):
+        if account_balance > self._peak_balance:
+            self._peak_balance = account_balance
+            self._dd_pause_logged = False
+            self._dd_kill_logged  = False
+
+    def drawdown_pct(self, account_balance: float) -> float:
+        if self._peak_balance <= 1e-9:
+            return 0.0
+        return max(0.0, (self._peak_balance - account_balance) / self._peak_balance)
+
+    @property
+    def peak_balance(self) -> float:
+        return self._peak_balance
+
+    @property
+    def kill_switch_active(self) -> bool:
+        return self._kill_switch_armed
 
     def already_in_pair(self, pair: str) -> bool:
         return any(t.pair == pair for t in self._open_trades.values())
@@ -146,6 +282,10 @@ class RiskManager:
         stop: float,
         target: float,
         volume: float,
+        confidence: float = 0.0,
+        regime: str = "",
+        entry_txid: str = "",
+        broker_stop_txid: str = "",
     ) -> Trade:
         self._trade_counter += 1
         trade_id = f"T{self._trade_counter:04d}"
@@ -159,6 +299,10 @@ class RiskManager:
             volume=volume,
             trailing_stop=stop,
             r_value=abs(entry - stop),
+            confidence=confidence,
+            regime=regime,
+            entry_txid=entry_txid,
+            broker_stop_txid=broker_stop_txid,
         )
         self._open_trades[trade_id] = trade
         logger.info(
@@ -181,6 +325,7 @@ class RiskManager:
         self._trade_history.append((trade.pnl, trade_value))
         won = trade.pnl > 0
         self.record_trade_result(won)
+        self._append_history(trade, exit_price, reason)
         logger.info(
             "Closed trade %s | exit %.4f | PnL %.4f | %s",
             trade_id, exit_price, trade.pnl, reason,
@@ -209,26 +354,34 @@ class RiskManager:
         return half
 
     def exit_70_hold_30(
-        self, trade_id: str, exit_price: float, wide_stop: float
+        self,
+        trade_id:  str,
+        exit_price: float,
+        wide_stop:  float,
+        hold_pct:   float = 0.30,
     ) -> Optional[float]:
         """
-        Take-profit exit: close 70%, hold remaining 30% with wide_stop.
-        Returns volume closed (70%).
+        Partial take-profit exit.  hold_pct fraction is kept open with wide_stop.
+        Regime-driven split: BEAR 80/20, CHOPPY 75/25, BULL 60/40, PARABOLIC 50/50.
+        Returns volume closed (exit_pct portion), or None if already active.
         """
         trade = self._open_trades.get(trade_id)
         if not trade or trade.hold_30_active:
             return None
-        close_vol = round(trade.volume * 0.70, 8)
-        hold_vol  = round(trade.volume * 0.30, 8)
+        exit_pct  = round(1.0 - hold_pct, 8)
+        close_vol = round(trade.volume * exit_pct, 8)
+        hold_vol  = round(trade.volume * hold_pct, 8)
         sign = 1 if trade.side == "buy" else -1
         self._daily_pnl += sign * (exit_price - trade.entry_price) * close_vol
-        trade.volume        = hold_vol
+        trade.volume         = hold_vol
         trade.hold_30_active = True
-        trade.wide_stop     = wide_stop
-        trade.trailing_stop = wide_stop
-        trade.stop_loss     = wide_stop
+        trade.wide_stop      = wide_stop
+        trade.trailing_stop  = wide_stop
+        trade.stop_loss      = wide_stop
         logger.info(
-            "Take-profit 70%% exit | %s | closed %.8f @ %.4f | holding %.8f with wide SL %.4f (weekly 20MA)",
+            "Partial TP %.0f%%/%.0f%% | %s | closed %.8f @ %.4f | "
+            "holding %.8f with wide SL %.4f (weekly 20MA)",
+            exit_pct * 100, hold_pct * 100,
             trade.pair, close_vol, exit_price, hold_vol, wide_stop,
         )
         return close_vol
@@ -285,13 +438,63 @@ class RiskManager:
                 exits.append((tid, ma, "weekly_20ma_break"))
         return exits
 
+    # ── Pyramiding ────────────────────────────────────────────────────────────
+
+    def add_pyramid(
+        self,
+        trade_id: str,
+        price:    float,
+        volume:   float,
+        new_stop: float,
+    ) -> Optional[Trade]:
+        """Add to a winning position. Max 2 pyramids. Stop only moves toward profit."""
+        trade = self._open_trades.get(trade_id)
+        if not trade or trade.pyramid_count >= 2:
+            return None
+        if trade.original_volume == 0.0:
+            trade.original_volume = trade.volume
+        trade.pyramid_count += 1
+        trade.volume += volume
+        if trade.side == "buy":
+            trade.stop_loss    = max(trade.stop_loss,    new_stop)
+            trade.trailing_stop = max(trade.trailing_stop, new_stop)
+        else:
+            trade.stop_loss    = min(trade.stop_loss,    new_stop)
+            trade.trailing_stop = min(trade.trailing_stop, new_stop)
+        logger.info(
+            "PYRAMID #%d | %s | +%.8f @ %.4f | SL → %.4f | total_vol=%.8f",
+            trade.pyramid_count, trade.pair, volume, price, new_stop, trade.volume,
+        )
+        return trade
+
     # ── ATR trailing stop ─────────────────────────────────────────────────────
+
+    def tighten_trailing_stop(
+        self,
+        trade_id: str,
+        price: float,
+        atr: float,
+        tight_mult: float = 0.5,
+    ):
+        """Tighten stop on a specific trade to tight_mult × ATR_mult × ATR."""
+        trade = self._open_trades.get(trade_id)
+        if not trade or not self.cfg.trailing_stop:
+            return
+        offset = atr * self.cfg.trailing_stop_atr_mult * tight_mult
+        if trade.side == "buy":
+            new_stop = round(price - offset, 8)
+            if new_stop > trade.trailing_stop:
+                trade.trailing_stop = new_stop
+        else:
+            new_stop = round(price + offset, 8)
+            if new_stop < trade.trailing_stop:
+                trade.trailing_stop = new_stop
 
     def update_trailing_stops(
         self,
         prices: Dict[str, float],
         atr_values: Dict[str, float],
-        trail_mult: float = 1.0,
+        trail_mult: Union[float, Dict[str, float]] = 1.0,
     ):
         for tid, trade in list(self._open_trades.items()):
             if trade.partial_exit_done or trade.hold_30_active:
@@ -300,7 +503,12 @@ class RiskManager:
             atr   = atr_values.get(trade.pair)
             if price is None or atr is None or not self.cfg.trailing_stop:
                 continue
-            offset = atr * self.cfg.trailing_stop_atr_mult * trail_mult
+            mult = (
+                trail_mult.get(trade.pair, 1.0)
+                if isinstance(trail_mult, dict)
+                else trail_mult
+            )
+            offset = atr * self.cfg.trailing_stop_atr_mult * mult
             if trade.side == "buy":
                 new_stop = price - offset
                 if new_stop > trade.trailing_stop:

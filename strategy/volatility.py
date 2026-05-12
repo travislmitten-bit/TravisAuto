@@ -80,8 +80,9 @@ class VolatilityTracker:
     _MIN_DATA = 30    # ≥ 5 days of readings before detection activates
 
     def __init__(self):
-        self._history: Dict[str, Deque[float]] = {}
-        self._primed:  Dict[str, bool]         = {}
+        self._history:  Dict[str, Deque[float]] = {}
+        self._primed:   Dict[str, bool]         = {}
+        self._bb_walk:  Dict[str, bool]         = {}
 
     def update(self, pair: str, closes: List[float]) -> bool:
         """
@@ -126,3 +127,46 @@ class VolatilityTracker:
 
     def size_scalar(self, pair: str) -> float:
         return 1.5 if self.is_primed(pair) else 1.0
+
+    def check_bb_walk(
+        self,
+        pair:      str,
+        closes:    List[float],
+        period:    int   = 20,
+        mult:      float = 2.0,
+        min_walk:  int   = 3,
+    ) -> bool:
+        """
+        Returns True when the last `min_walk` consecutive 4H closes are above
+        the upper Bollinger Band. Signals parabolic / trend-exhaustion conditions.
+        Effect (applied in main.py): switch to weekly exit, trail at 2× normal.
+        Logs only on state transition.
+        """
+        n = len(closes)
+        if n < period + min_walk:
+            self._bb_walk[pair] = False
+            return False
+
+        for offset in range(-min_walk, 0):
+            idx = n + offset
+            segment = closes[idx - period: idx]
+            if len(segment) < period:
+                self._bb_walk[pair] = False
+                return False
+            arr   = np.array(segment, dtype=float)
+            upper = float(arr.mean() + mult * arr.std())
+            if closes[idx] <= upper:
+                if self._bb_walk.get(pair):
+                    logger.info("BB_WALK ended | %s | price returned below upper BB", pair)
+                self._bb_walk[pair] = False
+                return False
+
+        was_walking = self._bb_walk.get(pair, False)
+        self._bb_walk[pair] = True
+        if not was_walking:
+            logger.warning(
+                "BB_WALK | %s | %d+ consecutive closes above upper BB | "
+                "switching to weekly exit, trail 2× normal",
+                pair, min_walk,
+            )
+        return True

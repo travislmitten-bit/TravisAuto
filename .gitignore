@@ -4,4 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 logs/*.log
+data/trade_history.json
+data/*.tmp
+.claude/settings.local.json
 .DS_Store
