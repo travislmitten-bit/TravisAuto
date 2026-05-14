@@ -49,8 +49,6 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import requests
 
-from html.parser import HTMLParser
-
 logger = logging.getLogger(__name__)
 
 _WEIGHTS: Dict[str, float] = {
@@ -60,14 +58,6 @@ _WEIGHTS: Dict[str, float] = {
     "on_chain_btc":    0.15,
     "mempool":         0.10,
     "solana_activity": 0.10,
-}
-
-# Kraken pair → OKX perpetual instrument (for L/S ratio)
-_PAIR_TO_OKX: Dict[str, str] = {
-    "XBTUSD":  "BTC-USDT-SWAP",
-    "SOLUSD":  "SOL-USDT-SWAP",
-    "TAOUSD":  "TAO-USDT-SWAP",
-    "LINKUSD": "LINK-USDT-SWAP",
 }
 
 _CACHE_TTL = 4 * 3600
@@ -428,187 +418,161 @@ class DataScanner:
             logger.warning("Blockchain.com stats fetch failed: %s", e)
             return None
 
-    # ── Source 5: Bitcoin ETF flows (farside.co.uk) ──────────────────────────
+    # ── Source 5: Bitcoin ETF flows ──────────────────────────────────────────
+    # Source chain: CoinGlass (primary) → Glassnode free tier (fallback) → N/A.
+    # Farside removed (persistently Cloudflare-blocked from server IPs).
+
+    @staticmethod
+    def _etf_adj_from_streak(streak: int) -> float:
+        """Same +8/-8 thresholds whether source is CoinGlass, Glassnode, etc."""
+        if streak >= 5:
+            return 8.0
+        if streak <= -3:
+            return -8.0
+        return 0.0
 
     def _fetch_etf_flows(self) -> Tuple[float, int]:
         """
-        Scrapes farside.co.uk daily ETF flow totals.
-        5+ consecutive positive days → +8 composite.
-        3+ consecutive negative days → −8 composite.
-        Returns (composite_adj, streak) where streak sign = direction.
+        Returns (composite_adj, streak) using the first source that produces
+        usable data. Each source returns None on failure; final fallback is
+        (0.0, 0) which is the N/A signal (no composite adjustment).
+        """
+        # 1) CoinGlass — primary
+        result = self._fetch_etf_coinglass()
+        if result is not None:
+            adj, streak = result
+            self._log_etf_outcome("CoinGlass", adj, streak)
+            return adj, streak
+
+        # 2) Glassnode — only attempted if API key present
+        if self._glassnode_key:
+            result = self._fetch_etf_glassnode()
+            if result is not None:
+                adj, streak = result
+                self._log_etf_outcome("Glassnode", adj, streak)
+                return adj, streak
+
+        # 3) Final fallback — N/A
+        logger.warning("ETF FLOWS | all sources unavailable — ETF=N/A in composite")
+        return 0.0, 0
+
+    def _log_etf_outcome(self, source: str, adj: float, streak: int):
+        if streak >= 5:
+            logger.info("ETF FLOWS | source=%s | +%d consecutive inflow days → +8 composite",
+                        source, abs(streak))
+        elif streak <= -3:
+            logger.warning("ETF FLOWS | source=%s | %d consecutive outflow days → −8 composite",
+                           source, abs(streak))
+        else:
+            logger.info("ETF FLOWS | source=%s | streak=%+d | NEUTRAL", source, streak)
+
+    def _fetch_etf_coinglass(self) -> Optional[Tuple[float, int]]:
+        """
+        CoinGlass spot-ETF list. Endpoint shape varies by API version; we try
+        to extract a list of ETFs each with daily flow data, aggregate signed
+        daily flows across ETFs, then compute the trailing streak.
+        Returns None on any failure so caller can fall through.
         """
         try:
             r = self._session.get(
-                "https://farside.co.uk/bitcoin-etf-flow-all-data-table/",
+                "https://open-api.coinglass.com/public/v2/etf/list",
                 timeout=_TIMEOUT,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": "text/html,application/xhtml+xml",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": "https://www.google.com/",
-                },
+                headers={"accept": "application/json"},
             )
+            if r.status_code in (401, 403):
+                logger.info("ETF FLOWS | CoinGlass auth required (status=%d) — trying next source",
+                            r.status_code)
+                return None
             r.raise_for_status()
+            payload = r.json()
+            data = payload.get("data")
+            if not isinstance(data, list) or not data:
+                logger.info("ETF FLOWS | CoinGlass returned no list data — trying next source")
+                return None
 
-            class _RowParser(HTMLParser):
-                def __init__(self):
-                    super().__init__()
-                    self.rows: List[List[str]] = []
-                    self._row: List[str] = []
-                    self._cell = ""
-                    self._in_cell = False
-                    self._in_body = False
-
-                def handle_starttag(self, tag, attrs):
-                    if tag == "tbody":
-                        self._in_body = True
-                    elif tag == "tr" and self._in_body:
-                        self._row = []
-                    elif tag in ("td", "th") and self._in_body:
-                        self._in_cell = True
-                        self._cell = ""
-
-                def handle_endtag(self, tag):
-                    if tag == "tbody":
-                        self._in_body = False
-                    elif tag == "tr" and self._in_body and self._row:
-                        self.rows.append(self._row[:])
-                        self._row = []
-                    elif tag in ("td", "th") and self._in_cell:
-                        self._row.append(self._cell.strip())
-                        self._in_cell = False
-
-                def handle_data(self, data):
-                    if self._in_cell:
-                        self._cell += data
-
-            parser = _RowParser()
-            parser.feed(r.text)
-
-            totals: List[float] = []
-            for row in parser.rows:
-                if not row:
+            # Aggregate signed daily flows across ETFs. Try common shapes:
+            #   each entry has 'priceList' / 'flowList' / 'history' time-series.
+            daily_totals: Dict[str, float] = {}
+            for entry in data:
+                if not isinstance(entry, dict):
                     continue
-                raw = row[-1].replace(",", "").replace("$", "").strip()
-                if raw in ("-", "", "Total", "Totals"):
-                    continue
-                try:
-                    totals.append(float(raw))
-                except ValueError:
-                    pass
+                series = (entry.get("priceList")
+                          or entry.get("flowList")
+                          or entry.get("history")
+                          or entry.get("fundFlow")
+                          or [])
+                for pt in series:
+                    if not isinstance(pt, dict):
+                        continue
+                    # Common keys for the daily flow value
+                    flow = (pt.get("flow")
+                            or pt.get("fundFlow")
+                            or pt.get("netFlow")
+                            or pt.get("value"))
+                    date = pt.get("date") or pt.get("time") or pt.get("createTime")
+                    if flow is None or date is None:
+                        continue
+                    try:
+                        daily_totals[str(date)] = daily_totals.get(str(date), 0.0) + float(flow)
+                    except (TypeError, ValueError):
+                        continue
 
-            if len(totals) < 3:
-                logger.debug("ETF flows: insufficient data (%d rows)", len(totals))
-                return 0.0, 0
+            if len(daily_totals) < 3:
+                logger.info("ETF FLOWS | CoinGlass: only %d daily aggregates — trying next source",
+                            len(daily_totals))
+                return None
 
-            recent = totals[-10:]
-            sign   = 1 if recent[-1] > 0 else -1
-            streak = 0
-            for v in reversed(recent):
+            ordered = [v for _, v in sorted(daily_totals.items())][-10:]
+            sign    = 1 if ordered[-1] > 0 else -1
+            streak  = 0
+            for v in reversed(ordered):
                 if (v > 0 and sign > 0) or (v < 0 and sign < 0):
                     streak += 1
                 else:
                     break
             streak *= sign
-
-            if streak >= 5:
-                adj = 8.0
-                logger.info("ETF FLOWS | +%d consecutive positive days → +8 composite", abs(streak))
-            elif streak <= -3:
-                adj = -8.0
-                logger.warning(
-                    "ETF FLOWS | %d consecutive negative days → −8 composite | "
-                    "tighten stops 20%%",
-                    abs(streak),
-                )
-            else:
-                adj = 0.0
-                logger.debug("ETF FLOWS | streak=%+d | NEUTRAL", streak)
-
-            return adj, streak
+            return self._etf_adj_from_streak(streak), streak
         except Exception as e:
-            logger.warning("ETF flow primary (farside) failed: %s — trying Yahoo fallback", e)
-            return self._fetch_etf_flows_yahoo()
+            logger.info("ETF FLOWS | CoinGlass fetch failed: %s — trying next source", e)
+            return None
 
-    def _fetch_etf_flows_yahoo(self) -> Tuple[float, int]:
+    def _fetch_etf_glassnode(self) -> Optional[Tuple[float, int]]:
         """
-        Fallback ETF flow proxy using Yahoo Finance v8 chart endpoint.
-        Aggregates signed daily dollar-flow across IBIT, FBTC, BITB, ARKB
-        (~80% of spot BTC ETF AUM). Net flow proxy = sign(close-open) × volume × close.
-        Returns (composite_adj, streak) using the same +8/-8 thresholds as farside.
+        Glassnode BTC ETF holdings time-series. Free-tier metric path:
+          /v1/metrics/etfs/spot_holdings_balance
+        We compute day-over-day balance deltas as net flow proxy.
+        Returns None on any failure.
         """
-        tickers = ["IBIT", "FBTC", "BITB", "ARKB"]
-        daily_totals: dict[int, float] = {}
-        for ticker in tickers:
-            try:
-                r = self._session.get(
-                    f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-                    params={"interval": "1d", "range": "30d"},
-                    timeout=_TIMEOUT,
-                    headers={"User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    )},
-                )
-                r.raise_for_status()
-                payload = r.json().get("chart", {}).get("result", [])
-                if not payload:
-                    continue
-                ts_arr  = payload[0].get("timestamp", []) or []
-                quote   = payload[0].get("indicators", {}).get("quote", [{}])[0]
-                opens   = quote.get("open",   []) or []
-                closes  = quote.get("close",  []) or []
-                vols    = quote.get("volume", []) or []
-                for ts, o, c, v in zip(ts_arr, opens, closes, vols):
-                    if None in (o, c, v) or v == 0:
-                        continue
-                    # Bucket by UTC date
-                    day_key = ts - (ts % 86400)
-                    signed_flow = (1.0 if c > o else -1.0 if c < o else 0.0) * float(c) * float(v)
-                    daily_totals[day_key] = daily_totals.get(day_key, 0.0) + signed_flow
-            except Exception as e:
-                logger.debug("Yahoo ETF fetch failed for %s: %s", ticker, e)
-
-        if len(daily_totals) < 3:
-            logger.warning("ETF flows fallback (Yahoo): insufficient data (%d days)", len(daily_totals))
-            return 0.0, 0
-
-        ordered = sorted(daily_totals.items())            # oldest → newest
-        flows   = [f for _, f in ordered[-10:]]           # last 10 trading days
-
-        sign = 1 if flows[-1] > 0 else -1
-        streak = 0
-        for v in reversed(flows):
-            if (v > 0 and sign > 0) or (v < 0 and sign < 0):
-                streak += 1
-            else:
-                break
-        streak *= sign
-
-        if streak >= 5:
-            adj = 8.0
-            logger.info(
-                "ETF FLOWS (Yahoo proxy) | +%d consecutive inflow days → +8 composite",
-                abs(streak),
+        try:
+            r = self._session.get(
+                "https://api.glassnode.com/v1/metrics/etfs/spot_holdings_balance",
+                params={"a": "BTC", "api_key": self._glassnode_key, "i": "24h"},
+                timeout=_TIMEOUT,
             )
-        elif streak <= -3:
-            adj = -8.0
-            logger.warning(
-                "ETF FLOWS (Yahoo proxy) | %d consecutive outflow days → −8 composite | "
-                "tighten stops 20%%",
-                abs(streak),
-            )
-        else:
-            adj = 0.0
-            logger.info(
-                "ETF FLOWS (Yahoo proxy) | streak=%+d (%d-day window) | NEUTRAL",
-                streak, len(flows),
-            )
-        return adj, streak
+            if r.status_code in (401, 403):
+                logger.info("ETF FLOWS | Glassnode auth/tier denied (status=%d)", r.status_code)
+                return None
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list) or len(data) < 4:
+                logger.info("ETF FLOWS | Glassnode: insufficient data points")
+                return None
+            balances = [float(pt["v"]) for pt in data[-15:] if pt.get("v") is not None]
+            if len(balances) < 4:
+                return None
+            deltas = [balances[i] - balances[i - 1] for i in range(1, len(balances))][-10:]
+            sign   = 1 if deltas[-1] > 0 else -1
+            streak = 0
+            for v in reversed(deltas):
+                if (v > 0 and sign > 0) or (v < 0 and sign < 0):
+                    streak += 1
+                else:
+                    break
+            streak *= sign
+            return self._etf_adj_from_streak(streak), streak
+        except Exception as e:
+            logger.info("ETF FLOWS | Glassnode fetch failed: %s", e)
+            return None
 
     # ── Source 6: Mempool.space fee market ────────────────────────────────────
 
@@ -895,66 +859,110 @@ class DataScanner:
             logger.debug("NUPL fetch failed: %s", e)
             return None, "NEUTRAL"
 
-    # ── Godmode 2: Long/Short Ratio (OKX per asset) ───────────────────────────
+    # ── Godmode 2: Long/Short Ratio (CoinGlass for BTC/SOL, neutral 1.0 for TAO/LINK) ──
+
+    # Only BTC and SOL have widely-traded perpetuals with reliable L/S data.
+    # TAO and LINK fall back to neutral 1.0 (no composite adjustment).
+    _PAIR_TO_COINGLASS: Dict[str, str] = {
+        "XBTUSD":  "BTC",
+        "SOLUSD":  "SOL",
+    }
 
     def _fetch_long_short_ratios(
         self,
     ) -> Tuple[Dict[str, float], Dict[str, float], float]:
         """
-        OKX account L/S ratio per asset.
-        < 0.80 → sentiment extreme short → +10 composite, +25% size
-        > 2.00 → overleveraged longs → −10 composite, −25% size (stops tightened in main.py)
+        L/S ratio per asset.
+          < 0.80 → extreme short sentiment   → +25% size, +2.5 composite
+          > 2.00 → overleveraged longs       → -25% size, -2.5 composite
+        BTC/SOL: live data from CoinGlass /public/v2/indicator/long_short_ratio.
+        TAO/LINK: neutral 1.0 (no composite adjustment) — no perpetual market.
         Returns (ratios, size_adjs, composite_adj).
         """
         ratios:    Dict[str, float] = {}
         size_adjs: Dict[str, float] = {}
         comp_adj = 0.0
 
-        for pair, inst_id in _PAIR_TO_OKX.items():
-            try:
-                r = self._session.get(
-                    "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio",
-                    params={"instId": inst_id, "period": "4H", "limit": "2"},
-                    timeout=_TIMEOUT,
-                )
-                r.raise_for_status()
-                payload = r.json()
-                rows = payload.get("data", [])
-                if not rows or len(rows[0]) < 3:
-                    logger.info(
-                        "L/S RATIO | %s (%s) | OKX returned no data | code=%s msg=%s",
-                        pair, inst_id, payload.get("code"), payload.get("msg"),
-                    )
-                    continue
-                long_pct  = float(rows[0][1])
-                short_pct = float(rows[0][2])
-                ls = long_pct / max(short_pct, 1e-9)
-                ratios[pair] = round(ls, 3)
+        # TAO/LINK: hardcoded neutral with no composite adjustment
+        for pair in ("TAOUSD", "LINKUSD"):
+            ratios[pair]    = 1.0
+            size_adjs[pair] = 1.0
+            logger.debug("L/S RATIO | %s | neutral=1.0 (no perpetual market)", pair)
 
-                if ls < 0.80:
-                    size_adjs[pair] = 1.25
-                    comp_adj += 2.5
-                    logger.info(
-                        "L/S RATIO | %s | %.2f < 0.80 → extreme short sentiment | +25%% size",
-                        pair, ls,
-                    )
-                elif ls > 2.00:
-                    size_adjs[pair] = 0.75
-                    comp_adj -= 2.5
-                    logger.warning(
-                        "L/S RATIO | %s | %.2f > 2.00 → overleveraged longs | −25%% size",
-                        pair, ls,
-                    )
-                else:
-                    size_adjs[pair] = 1.0
-                    logger.debug("L/S RATIO | %s | %.2f | NEUTRAL", pair, ls)
-            except Exception as e:
-                logger.warning("L/S RATIO | %s (%s) | OKX fetch failed: %s", pair, inst_id, e)
+        # BTC/SOL: live from CoinGlass
+        for pair, symbol in self._PAIR_TO_COINGLASS.items():
+            ls = self._fetch_ls_coinglass(symbol)
+            if ls is None:
+                # CoinGlass unavailable — degrade to neutral, no adjustment
+                ratios[pair]    = 1.0
+                size_adjs[pair] = 1.0
+                continue
+            ratios[pair] = round(ls, 3)
+            if ls < 0.80:
+                size_adjs[pair] = 1.25
+                comp_adj += 2.5
+                logger.info(
+                    "L/S RATIO | %s | source=CoinGlass | %.2f < 0.80 → extreme short | +25%% size",
+                    pair, ls,
+                )
+            elif ls > 2.00:
+                size_adjs[pair] = 0.75
+                comp_adj -= 2.5
+                logger.warning(
+                    "L/S RATIO | %s | source=CoinGlass | %.2f > 2.00 → overleveraged longs | -25%% size",
+                    pair, ls,
+                )
+            else:
+                size_adjs[pair] = 1.0
+                logger.info("L/S RATIO | %s | source=CoinGlass | %.2f | NEUTRAL", pair, ls)
 
         comp_adj = max(-10.0, min(10.0, comp_adj))
         if ratios:
             logger.info("L/S Ratios | %s", {p: f"{v:.2f}" for p, v in ratios.items()})
         return ratios, size_adjs, comp_adj
+
+    def _fetch_ls_coinglass(self, symbol: str) -> Optional[float]:
+        """
+        Fetch global L/S ratio for `symbol` ('BTC', 'SOL') from CoinGlass.
+        Returns the long/short ratio (longRatio/shortRatio) or None on failure.
+        """
+        try:
+            r = self._session.get(
+                "https://open-api.coinglass.com/public/v2/indicator/long_short_ratio",
+                params={"symbol": symbol, "time_type": "h4"},
+                timeout=_TIMEOUT,
+                headers={"accept": "application/json"},
+            )
+            if r.status_code in (401, 403):
+                logger.info("L/S RATIO | CoinGlass auth required for %s (status=%d)",
+                            symbol, r.status_code)
+                return None
+            r.raise_for_status()
+            payload = r.json()
+            data = payload.get("data")
+            if not data:
+                logger.info("L/S RATIO | CoinGlass returned no data for %s", symbol)
+                return None
+            # Time-series form: [{"longRatio": ..., "shortRatio": ..., "longShortRatio": ...}, ...]
+            if isinstance(data, list) and data:
+                latest = data[-1] if isinstance(data[-1], dict) else None
+            elif isinstance(data, dict):
+                latest = data
+            else:
+                return None
+            if not isinstance(latest, dict):
+                return None
+            # Common keys across CoinGlass response shapes
+            if "longShortRatio" in latest:
+                return float(latest["longShortRatio"])
+            lr = latest.get("longRatio") or latest.get("longRate")
+            sr = latest.get("shortRatio") or latest.get("shortRate")
+            if lr is not None and sr is not None and float(sr) > 1e-9:
+                return float(lr) / float(sr)
+            return None
+        except Exception as e:
+            logger.info("L/S RATIO | CoinGlass fetch failed for %s: %s", symbol, e)
+            return None
 
     # ── Godmode 3: Social sentiment via CoinGecko community data ─────────────
 
