@@ -13,6 +13,14 @@ Live Kraken trading bot — 4H trendline strategy across XBTUSD, SOLUSD, TAOUSD,
 | **GitHub** | https://github.com/travislmitten-bit/TravisAuto |
 | **Owner** | Travis Mitten, British Columbia, Canada — Pacific Time |
 
+## Claude Dashboard Integration
+
+- **Tunnel service:** `cloudflared.service` (systemd, auto-starts on reboot)
+- **Current URL:** https://prepare-known-deemed-novelty.trycloudflare.com
+- **Note:** URL changes on every restart. To get current URL run:
+  `journalctl -u cloudflared -n 50 --no-pager | grep trycloudflare.com | tail -1`
+- Claude fetches this URL on demand to analyse bot state, trades, and rejections
+
 ## Strategy
 
 **Tori 4H trendline strategy.** Entry on:
