@@ -22,10 +22,11 @@ logger = logging.getLogger(__name__)
 
 # Kraken pair → common symbol (for LunarCrush / external APIs)
 PAIR_TO_SYMBOL: Dict[str, str] = {
-    "XBTUSD": "BTC",
-    "SOLUSD": "SOL",
-    "TAOUSD": "TAO",
+    "XBTUSD":  "BTC",
+    "SOLUSD":  "SOL",
+    "TAOUSD":  "TAO",
     "LINKUSD": "LINK",
+    "XRPUSD":  "XRP",
 }
 
 

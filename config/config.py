@@ -46,7 +46,7 @@ class ScannerConfig:
 class BotConfig:
     pairs: List[str] = field(default_factory=lambda: [
         p.strip() for p in
-        os.getenv("PAIRS", "XBTUSD,SOLUSD,TAOUSD,LINKUSD").split(",")
+        os.getenv("PAIRS", "XBTUSD,SOLUSD,TAOUSD,LINKUSD,XRPUSD").split(",")
         if p.strip()
     ])
     interval: int = int(os.getenv("INTERVAL", "240"))

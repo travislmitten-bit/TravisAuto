@@ -80,6 +80,7 @@ _PAIR_TO_CG: Dict[str, str] = {
     "SOLUSD":  "solana",
     "TAOUSD":  "bittensor",
     "LINKUSD": "chainlink",
+    "XRPUSD":  "ripple",
 }
 
 # BTC community size used to normalise galaxy_score (log10(~14M) ≈ 7.15)
@@ -866,6 +867,7 @@ class DataScanner:
     _PAIR_TO_COINGLASS: Dict[str, str] = {
         "XBTUSD":  "BTC",
         "SOLUSD":  "SOL",
+        "XRPUSD":  "XRP",
     }
 
     def _fetch_long_short_ratios(
@@ -971,6 +973,7 @@ class DataScanner:
     _STATIC_GS: Dict[str, float] = {
         "XBTUSD":  95.0,
         "SOLUSD":  82.0,
+        "XRPUSD":  88.0,
         "LINKUSD": 72.0,
         "TAOUSD":  45.0,   # below 60 → no automatic confidence boost
     }
